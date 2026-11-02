@@ -63,7 +63,7 @@ from .eetq import dispatch_eetq
 from .gptq import dispatch_gptq
 from .hqq import dispatch_hqq
 from .inc import dispatch_inc
-from .layer import Embedding, LoraLayer, MultiheadAttention, ParamWrapper, _ConvNd, dispatch_default
+from .layer import Embedding, Linear, LoraLayer, MultiheadAttention, ParamWrapper, _ConvNd, dispatch_default
 from .te import dispatch_transformer_engine
 from .torchao import dispatch_torchao
 from .tp_layer import dispatch_megatron
@@ -974,6 +974,15 @@ class LoraModel(BaseTuner):
         # if no valid adapter, nothing to do
         if len(valid_adapters) == 0:
             raise ValueError("No matching LoRAs found. Please raise an issue on GitHub.")
+
+        # Fast path: for plain "svd" the combined delta is a sum of low-rank products, so the SVD can be computed from
+        # the LoRA factors directly instead of decomposing the dense out x in matrix. Falls back to the dense path below
+        # whenever the factorized computation does not apply (returns None).
+        if combination_type == "svd" and clamp is None and type(target) in (Linear, Embedding):
+            factorized = self._factorized_svd_weighted_adapter(target, valid_adapters, valid_weights, new_rank, driver)
+            if factorized is not None:
+                return factorized
+
         # get_delta_weight applies the scaling, no need to handle it explicitly
         delta_weight = [target.get_delta_weight(adapter) for adapter in valid_adapters]
         valid_weights = torch.tensor(valid_weights).to(delta_weight[0].device)
@@ -1012,6 +1021,49 @@ class LoraModel(BaseTuner):
         if is_conv:
             U = U.reshape(target_lora_B.data.shape)
             Vh = Vh.reshape(target_lora_A.data.shape)
+        return Vh, U
+
+    @staticmethod
+    def _factorized_svd_weighted_adapter(target, adapters, weights, new_rank, driver=None):
+        """
+        Truncated SVD of the weighted sum of LoRA updates, computed from the LoRA factors without materializing the
+        dense delta weight.
+
+        With `delta = sum_i w_i * s_i * B_i @ A_i = B_cat @ A_cat`, where `B_cat` is `out x R` and `A_cat` is `R x in`
+        and `R` is the sum of the adapter ranks, a reduced QR of both factors reduces the problem to an SVD of a small
+        `R x R` matrix: `B_cat = Q_b R_b`, `A_cat^T = Q_a R_a` and `svd(R_b @ R_a^T) = U_c S V_c^T` give
+        `delta = (Q_b U_c) S (V_c^T Q_a^T)`. The result is exact, i.e. identical (up to the sign of the singular vectors)
+        to decomposing the dense delta.
+
+        Returns `(lora_A, lora_B)` weights, or `None` if the dense path should be used instead: when the factors are not
+        float32/float64 (the dense path does not support low precision dtypes either), when the combined rank `R` is not
+        smaller than `min(out, in)` (no savings) or when `new_rank` exceeds `R` (the factorization has fewer singular
+        vectors than requested).
+        """
+        is_embedding = not any(adapter in target.lora_A for adapter in adapters)
+        factors_A, factors_B = [], []
+        for adapter, weight in zip(adapters, weights):
+            if is_embedding:
+                lora_A, lora_B = target.lora_embedding_A[adapter], target.lora_embedding_B[adapter]
+            else:
+                lora_A, lora_B = target.lora_A[adapter].weight, target.lora_B[adapter].weight
+            if lora_A.dtype not in (torch.float32, torch.float64) or lora_B.dtype != lora_A.dtype:
+                return None
+            # same layout for Linear (incl. fan_in_fan_out) and Embedding: delta = B @ A with shape (out, in)
+            factors_A.append(lora_A.data)
+            factors_B.append(lora_B.data * (weight * target.scaling[adapter]))
+
+        cat_A = torch.cat(factors_A, dim=0)  # R x in
+        cat_B = torch.cat(factors_B, dim=1)  # out x R
+        rank = cat_A.shape[0]
+        if rank >= min(cat_B.shape[0], cat_A.shape[1]) or new_rank > rank:
+            return None
+
+        q_b, r_b = torch.linalg.qr(cat_B)  # (out x R), (R x R)
+        q_a, r_a = torch.linalg.qr(cat_A.T)  # (in x R), (R x R)
+        U, S, Vh = torch.linalg.svd(r_b @ r_a.T, full_matrices=False, driver=driver)
+        U = (q_b @ U[:, :new_rank]) * S[:new_rank]  # same as U @ diag(S) in the dense path
+        Vh = Vh[:new_rank, :] @ q_a.T
         return Vh, U
 
     def _generalized_task_arithmetic_weighted_adapter(
