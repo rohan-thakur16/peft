@@ -4836,6 +4836,77 @@ class TestPeftCustomModel(PeftCommonTester):
         assert dw_merged.shape == module.base_layer.weight.shape
         assert torch.allclose(dw_merged, expected, atol=1e-5, rtol=1e-5)
 
+    @pytest.mark.parametrize(
+        "make_layer, config_kwargs",
+        [
+            (lambda: nn.Linear(32, 24), {}),
+            (lambda: Conv1D(24, 32), {"fan_in_fan_out": True}),
+            (lambda: nn.Embedding(40, 24), {}),
+        ],
+        ids=["linear", "conv1d", "embedding"],
+    )
+    @pytest.mark.parametrize("svd_rank", [8, 4])
+    def test_add_weighted_adapter_svd_factorized_matches_dense_svd(self, make_layer, config_kwargs, svd_rank):
+        # The SVD of the merged LoRA update is computed from the LoRA factors (QR + SVD of a small matrix) instead of
+        # decomposing the dense delta weight. The result must be the same as the truncated SVD of the dense weighted sum.
+        torch.manual_seed(0)
+
+        class Model(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.layer = make_layer()
+
+        weights = [0.7, -0.4]
+        config0 = LoraConfig(target_modules=["layer"], r=4, init_lora_weights=False, **config_kwargs)
+        config1 = LoraConfig(target_modules=["layer"], r=4, lora_alpha=5, init_lora_weights=False, **config_kwargs)
+        model = get_peft_model(Model(), config0, adapter_name="adapter1")
+        model.add_adapter("adapter2", config1)
+        # combined rank is 8, which is smaller than min(out, in), so the factorized path is used
+        model.add_weighted_adapter(
+            adapters=["adapter1", "adapter2"],
+            weights=weights,
+            adapter_name="merged",
+            combination_type="svd",
+            svd_rank=svd_rank,
+        )
+
+        module = model.base_model.model.layer
+        expected = weights[0] * module.get_delta_weight("adapter1") + weights[1] * module.get_delta_weight("adapter2")
+        U, S, Vh = torch.linalg.svd(expected, full_matrices=False)
+        expected_truncated = (U[:, :svd_rank] * S[:svd_rank]) @ Vh[:svd_rank]
+
+        dw_merged = module.get_delta_weight("merged")
+        assert dw_merged.shape == expected.shape
+        torch.testing.assert_close(dw_merged, expected_truncated, rtol=1e-4, atol=1e-4)
+        assert model.peft_config["merged"].r == svd_rank
+
+    def test_add_weighted_adapter_svd_rank_larger_than_combined_rank(self):
+        # When svd_rank exceeds the combined rank of the adapters, the factorized SVD cannot provide enough singular
+        # vectors, so the dense SVD is used and the merged adapter keeps the requested rank.
+        torch.manual_seed(0)
+
+        class Model(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.layer = nn.Linear(32, 24)
+
+        config = LoraConfig(target_modules=["layer"], r=2, init_lora_weights=False)
+        model = get_peft_model(Model(), config, adapter_name="adapter1")
+        model.add_adapter("adapter2", config)
+        model.add_weighted_adapter(
+            adapters=["adapter1", "adapter2"],
+            weights=[0.5, 0.5],
+            adapter_name="merged",
+            combination_type="svd",
+            svd_rank=8,
+        )
+
+        module = model.base_model.model.layer
+        assert module.lora_A["merged"].weight.shape == (8, 32)
+        assert module.lora_B["merged"].weight.shape == (24, 8)
+        expected = 0.5 * module.get_delta_weight("adapter1") + 0.5 * module.get_delta_weight("adapter2")
+        torch.testing.assert_close(module.get_delta_weight("merged"), expected, rtol=1e-4, atol=1e-5)
+
     def test_multiple_adapters_no_needless_copy_modules_to_save(self):
         # See 2206
         # The problem was that we keep a "global" modules_to_save on the model which contains all possible
